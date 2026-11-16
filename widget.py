@@ -30,31 +30,84 @@ APP_NAME = "SysMonWidget"
 SETTINGS_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 DEFAULT_SETTINGS = {"x": None, "y": None, "topmost": True, "alpha": 0.9,
-                    "scale": 1.0, "view": "bars"}
+                    "scale": 1.0, "view": "bars", "theme": "graphite", "transparent": False}
 
 UPDATE_MS = 1000          # обновление экрана раз в секунду
 LHM_URL = "http://127.0.0.1:8085/data.json"
 NA = "н/д"
 
 # ---------- оформление ----------
-BG = "#16181d"
-FG = "#e8e9ec"
-MUTED = "#8b919c"
-BAR_BG = "#2a2e36"
-GREEN = "#43c38a"
-YELLOW = "#e5b84b"
-RED = "#e5534b"
 FONT = "Segoe UI"
 
+# Цветовые темы. accent — цвет нормальной нагрузки, warn/danger — высокой и опасной.
+THEMES = {
+    "graphite": {"name": "Графит", "bg": "#16181d", "fg": "#e8e9ec", "muted": "#8b919c",
+                 "track": "#2a2e36", "accent": "#43c38a", "warn": "#e5b84b",
+                 "danger": "#ff4d4d", "needle": "#ff6a4d"},
+    "ocean": {"name": "Океан", "bg": "#0d1b2a", "fg": "#e6f1ff", "muted": "#8aa4c2",
+              "track": "#1d3149", "accent": "#38bdf8", "warn": "#facc15",
+              "danger": "#ff5a5a", "needle": "#fb923c"},
+    "lavender": {"name": "Лаванда", "bg": "#1a1428", "fg": "#f1eaff", "muted": "#a596c6",
+                 "track": "#2f2645", "accent": "#a78bfa", "warn": "#fcd34d",
+                 "danger": "#ff4f6d", "needle": "#f472b6"},
+    "teal": {"name": "Бирюза", "bg": "#0c1f1f", "fg": "#e0fbf7", "muted": "#7fb0aa",
+             "track": "#1b3936", "accent": "#2dd4bf", "warn": "#fbbf24",
+             "danger": "#ff5c5c", "needle": "#fde047"},
+    "sakura": {"name": "Сакура", "bg": "#241520", "fg": "#ffe9f4", "muted": "#c792ad",
+               "track": "#3d2434", "accent": "#f9a8d4", "warn": "#fcd34d",
+               "danger": "#ff3b3b", "needle": "#fb7185"},
+    "light": {"name": "Светлая", "bg": "#f4f5f7", "fg": "#16181d", "muted": "#5f6672",
+              "track": "#d6d9df", "accent": "#16a34a", "warn": "#c48a00",
+              "danger": "#e11d1d", "needle": "#e2552f"},
+}
 
-def bar_color(p):
-    if p is None:
-        return BAR_BG
-    if p < 60:
-        return GREEN
-    if p < 85:
-        return YELLOW
-    return RED
+
+def blend(c1, c2, t):
+    """Смешать два цвета: t=1 -> c1, t=0 -> c2."""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x * t + y * (1 - t)):02x}" for x, y in zip(a, b))
+
+
+def load_level(p):
+    """0 — норма, 1 — высокая нагрузка, 2 — очень высокая."""
+    if p is None or p < 60:
+        return 0
+    return 1 if p < 85 else 2
+
+
+def temp_level(t, limit):
+    """0 — норма, 1 — горячо (до предела <=12 °C), 2 — опасно (до предела <=4 °C)."""
+    if t is None or not limit:
+        return 0
+    if t >= limit - 4:
+        return 2
+    return 1 if t >= limit - 12 else 0
+
+
+def cpu_name():
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                           r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+        return str(winreg.QueryValueEx(k, "ProcessorNameString")[0]).strip()
+    except Exception:
+        return ""
+
+
+def cpu_tjmax(name):
+    """Максимальная допустимая температура процессора (Tjmax) по его модели.
+    Для Intel точное значение берётся из LibreHardwareMonitor (Distance to TjMax)."""
+    n = name.lower()
+    if "x3d" in n:
+        return 89                      # Ryzen X3D: 89–90 °C
+    if "amd fx" in n or "phenom" in n or "athlon ii" in n:
+        return 70                      # старые AMD
+    if "amd" in n or "ryzen" in n:
+        return 95                      # Ryzen / Threadripper / Athlon на Zen
+    if "intel" in n:
+        return 100
+    return 95
 
 
 def gb(b):
@@ -77,10 +130,21 @@ class NvidiaGpu:
         self.h = pynvml.nvmlDeviceGetHandleByIndex(0)
         name = pynvml.nvmlDeviceGetName(self.h)
         self.name = name.decode() if isinstance(name, bytes) else name
+        self.temp_limit = None
+        # Предел из драйвера: максимальная рабочая температура или порог сброса частот
+        for th, delta in (("NVML_TEMPERATURE_THRESHOLD_GPU_MAX", 0),
+                          ("NVML_TEMPERATURE_THRESHOLD_SLOWDOWN", -2)):
+            try:
+                self.temp_limit = pynvml.nvmlDeviceGetTemperatureThreshold(
+                    self.h, getattr(pynvml, th)) + delta
+                break
+            except Exception:
+                continue
 
     def read(self):
         nv, h = self.nv, self.h
-        out = {"util": None, "mem_used": None, "mem_total": None, "temp": None}
+        out = {"util": None, "mem_used": None, "mem_total": None, "temp": None,
+               "temp_limit": self.temp_limit}
         try:
             out["util"] = float(nv.nvmlDeviceGetUtilizationRates(h).gpu)
         except Exception:
@@ -221,14 +285,26 @@ def read_lhm_temps():
     walk(data, None)
 
     def pick(temps, preferred):
+        temps = [(n, v) for n, v in temps if "distance" not in n.lower()]
         for p in preferred:
             for name, v in temps:
                 if p in name.lower():
                     return v
         return max((v for _, v in temps), default=None)
 
-    return (pick(cpu_temps, ("tctl", "tdie", "package", "core average")),
-            pick(gpu_temps, ("gpu core", "core")))
+    # Intel: Tjmax = температура ядра + «Distance to TjMax»
+    tjmax = None
+    names = dict(cpu_temps)
+    for name, dist in cpu_temps:
+        if "distance to tjmax" in name.lower():
+            base = names.get(name[:name.lower().index(" distance")])
+            if base is not None:
+                tjmax = round(base + dist)
+                break
+
+    return {"cpu": pick(cpu_temps, ("tctl", "tdie", "package", "core average")),
+            "gpu": pick(gpu_temps, ("gpu core", "core")),
+            "cpu_tjmax": tjmax}
 
 
 class Collector(threading.Thread):
@@ -241,7 +317,8 @@ class Collector(threading.Thread):
         self.gpu_kind = None
         self._gpu_retry = 0
         self._lhm_next = 0
-        self._lhm = (None, None)
+        self._lhm = {}
+        self.cpu_tjmax = cpu_tjmax(cpu_name())
         psutil.cpu_percent(None)  # первый вызов всегда 0 — «разогреваем»
 
     def init_gpu(self):
@@ -276,19 +353,23 @@ class Collector(threading.Thread):
             except Exception:
                 self.gpu = None
         d.update({"gpu": g.get("util"), "vram_used": g.get("mem_used"),
-                  "vram_total": g.get("mem_total"), "gpu_temp": g.get("temp")})
+                  "vram_total": g.get("mem_total"), "gpu_temp": g.get("temp"),
+                  "gpu_temp_limit": g.get("temp_limit")})
 
-        # LibreHardwareMonitor: опрашиваем раз в 2 с; если не запущен — раз в 30 с
+        # LibreHardwareMonitor: опрашиваем раз в 2 с; если не запущен — раз в 5 с
         if now >= self._lhm_next:
             try:
                 self._lhm = read_lhm_temps()
                 self._lhm_next = now + 2
             except Exception:
-                self._lhm = (None, None)
-                self._lhm_next = now + 30
-        d["cpu_temp"] = self._lhm[0]
+                self._lhm = {}
+                self._lhm_next = now + 5
+        d["cpu_temp"] = self._lhm.get("cpu")
+        d["cpu_temp_limit"] = self._lhm.get("cpu_tjmax") or self.cpu_tjmax
         if d["gpu_temp"] is None:
-            d["gpu_temp"] = self._lhm[1]
+            d["gpu_temp"] = self._lhm.get("gpu")
+        if not d["gpu_temp_limit"]:
+            d["gpu_temp_limit"] = 90 if d["gpu_temp"] is not None else None
         return d
 
     def run(self):
@@ -323,9 +404,6 @@ def save_settings(s):
 # Базовые размеры окна (при масштабе 100%) для каждого вида
 VIEWS = {"bars": (230, 182), "gauges": (360, 146)}
 MIN_SCALE, MAX_SCALE = 0.6, 3.0
-NEEDLE = "#ff6a4d"
-# Цветные зоны шкалы спидометра (тёмные оттенки зелёного/жёлтого/красного)
-ZONES = ((0, 60, "#1f5a41"), (60, 85, "#6b5622"), (85, 100, "#6e2c28"))
 METRICS = (("cpu", "CPU"), ("ram", "RAM"), ("gpu", "GPU"))
 
 
@@ -334,17 +412,18 @@ class Widget:
         self.s = load_settings()
         if self.s.get("view") not in VIEWS:
             self.s["view"] = "bars"
+        if self.s.get("theme") not in THEMES:
+            self.s["theme"] = "graphite"
         self.scale = clamp(float(self.s.get("scale") or 1.0), MIN_SCALE, MAX_SCALE)
 
         self.root = tk.Tk()
         self.root.title("Системный монитор")
         self.root.overrideredirect(True)          # без рамки
-        self.root.configure(bg=BG)
         self.root.attributes("-topmost", bool(self.s["topmost"]))
         self.root.attributes("-alpha", float(self.s["alpha"]))
         self.dpi = self.root.winfo_fpixels("1i") / 96.0
 
-        self.canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0, bd=0)
+        self.canvas = tk.Canvas(self.root, highlightthickness=0, bd=0)
         self.canvas.pack(fill="both", expand=True)
 
         self.target, self.shown, self.lines = {}, {}, {}
@@ -354,11 +433,12 @@ class Widget:
 
         self.W, self.H = self.size_for(self.scale)
         self.place_window()
-        self.round_corners()
 
         self.topmost_var = tk.BooleanVar(value=bool(self.s["topmost"]))
         self.alpha_var = tk.DoubleVar(value=float(self.s["alpha"]))
         self.view_var = tk.StringVar(value=self.s["view"])
+        self.theme_var = tk.StringVar(value=self.s["theme"])
+        self.transparent_var = tk.BooleanVar(value=bool(self.s["transparent"]))
         self.menu = self.build_menu()
 
         c = self.canvas
@@ -366,14 +446,54 @@ class Widget:
         c.bind("<B1-Motion>", self.on_drag)
         c.bind("<ButtonRelease-1>", self.on_release)
         c.bind("<Motion>", self.on_motion)
-        c.bind("<Enter>", lambda e: self.set_hover(True))
-        c.bind("<Leave>", lambda e: self.set_hover(False))
         c.bind("<Button-3>", self.show_menu)
 
         self.collector = Collector()
         self.collector.start()
-        self.redraw()
+        self.apply_style()
         self.root.after(300, self.refresh)
+        self.root.after(500, self.poll_hover)
+
+    # ----- оформление: тема и прозрачный фон -----
+    def apply_style(self):
+        t = self.t = THEMES[self.s["theme"]]
+        self.transparent = bool(self.s["transparent"])
+        bg = t["bg"]
+        # обводка текста в прозрачном режиме: почти цвет фона темы, но не точно он
+        # (точный цвет фона становится «дыркой» в окне)
+        r, g, b = (int(bg[i:i + 2], 16) for i in (1, 3, 5))
+        self.outline = f"#{r:02x}{g:02x}{b + 1 if b < 255 else b - 1:02x}"
+        self.zones = ((0, 60, blend(t["accent"], bg, 0.45)),
+                      (60, 85, blend(t["warn"], bg, 0.45)),
+                      (85, 100, blend(t["danger"], bg, 0.45)))
+        self.root.configure(bg=bg)
+        self.canvas.configure(bg=bg)
+        # Цвет фона темы становится полностью прозрачным (видно рабочий стол)
+        self.root.attributes("-transparentcolor", bg if self.transparent else "")
+        self.set_dwm_frame(not self.transparent)
+        self.refresh_lines()                       # подписи в цветах новой темы
+        self.redraw()
+
+    def set_dwm_frame(self, visible):
+        """Windows 11: скруглённые углы и тонкая рамка — только для обычного фона."""
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            dwm = ctypes.windll.dwmapi
+            corner = ctypes.c_int(2 if visible else 1)        # ROUND / DONOTROUND
+            dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(corner), 4)
+            border = ctypes.c_uint(0xFFFFFFFF if visible else 0xFFFFFFFE)  # DEFAULT / NONE
+            dwm.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(border), 4)
+        except Exception:
+            pass
+
+    def color_for_load(self, p):
+        return (self.t["accent"], self.t["warn"], self.t["danger"])[load_level(p)]
+
+    def temp_segment(self, temp, limit):
+        """Температура: обычная, жёлтая (горячо) или красная жирная (опасно)."""
+        lvl = temp_level(temp, limit)
+        color = (self.t["muted"], self.t["warn"], self.t["danger"])[lvl]
+        return (fmt_temp(temp), color, lvl == 2)
 
     # ----- размер и позиция -----
     def size_for(self, scale):
@@ -392,15 +512,6 @@ class Widget:
                 or not (vy <= y <= vy + vh - 40)):
             x, y = sw - self.W - 20, 20          # по умолчанию: правый верхний угол
         self.root.geometry(f"{self.W}x{self.H}+{int(x)}+{int(y)}")
-
-    def round_corners(self):
-        """Скруглённые углы в Windows 11 (в Windows 10 просто ничего не произойдёт)."""
-        try:
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            pref = ctypes.c_int(2)  # DWMWCP_ROUND
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(pref), 4)
-        except Exception:
-            pass
 
     def save_geometry(self):
         self.s["x"], self.s["y"] = self.root.winfo_x(), self.root.winfo_y()
@@ -421,10 +532,23 @@ class Widget:
         if self.canvas.cget("cursor") != cursor:
             self.canvas.config(cursor=cursor)
 
-    def set_hover(self, value):
-        if self._press is None and self.hover != value:
-            self.hover = value
-            self.redraw()
+    def poll_hover(self):
+        """Показываем уголок, только пока курсор над виджетом.
+        Положение курсора сверяем с прямоугольником окна (5 раз в секунду): на прозрачном
+        фоне Windows не сообщает окну о курсоре над пустыми местами, а так уголок
+        не пропадёт, пока к нему ведут мышь через прозрачную часть."""
+        try:
+            px, py = self.root.winfo_pointerxy()
+            x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+            inside = x <= px < x + self.W and y <= py < y + self.H
+            if self._press is None and inside != self.hover:
+                self.hover = inside
+                self.canvas.delete("grip")
+                if inside:
+                    self.draw_grip()
+        except Exception:
+            pass
+        self.root.after(200, self.poll_hover)
 
     def on_press(self, e):
         self._press = (self.corner_at(e.x, e.y), e.x_root, e.y_root,
@@ -464,6 +588,13 @@ class Widget:
         views.add_radiobutton(label="Спидометры", value="gauges", variable=self.view_var,
                               command=self.set_view)
         m.add_cascade(label="Вид", menu=views)
+        themes = tk.Menu(m, tearoff=0)
+        for key, th in THEMES.items():
+            themes.add_radiobutton(label=th["name"], value=key, variable=self.theme_var,
+                                   command=self.set_theme)
+        m.add_cascade(label="Цвет", menu=themes)
+        m.add_checkbutton(label="Прозрачный фон", variable=self.transparent_var,
+                          command=self.toggle_transparent)
         sub = tk.Menu(m, tearoff=0)
         for pct in (100, 90, 80, 70, 60, 50, 40):
             sub.add_radiobutton(label=f"{pct}%", value=pct / 100, variable=self.alpha_var,
@@ -489,6 +620,17 @@ class Widget:
         self.s["alpha"] = round(float(self.alpha_var.get()), 2)
         self.root.attributes("-alpha", self.s["alpha"])
         save_settings(self.s)
+
+    def set_theme(self):
+        self.s["theme"] = self.theme_var.get()
+        save_settings(self.s)
+        self.apply_style()
+
+    def toggle_transparent(self):
+        self.s["transparent"] = bool(self.transparent_var.get())
+        self.hover = False
+        save_settings(self.s)
+        self.apply_style()
 
     def resize_to(self, scale):
         self.scale = scale
@@ -516,35 +658,44 @@ class Widget:
         try:
             d = self.collector.data
             self.target = {"cpu": d.get("cpu"), "ram": d.get("ram"), "gpu": d.get("gpu")}
-            gpu_t = fmt_temp(d.get("gpu_temp"))
-            vram = fmt_mem(d.get("vram_used"), d.get("vram_total"))
-            self.lines = {
-                "bars": {"cpu": f"Температура: {fmt_temp(d.get('cpu_temp'))}",
-                         "ram": fmt_mem(d.get("ram_used"), d.get("ram_total")),
-                         "gpu": f"{gpu_t}  ·  VRAM {vram}"},
-                "gauges": {"cpu": (f"Темп. {fmt_temp(d.get('cpu_temp'))}", ""),
-                           "ram": (fmt_mem(d.get("ram_used"), d.get("ram_total")), ""),
-                           "gpu": (gpu_t, f"VRAM {vram}")},
-            }
-            self.animate()
+            self.refresh_lines()
+            self.animate(values=True)
         except Exception:
             pass  # никогда не падаем из-за отображения
         self.root.after(UPDATE_MS, self.refresh)
 
-    def animate(self):
-        """Стрелки и полосы плавно «доезжают» до нового значения (~0.3 с)."""
+    def refresh_lines(self):
+        """Подписи под показателями. Каждая — список кусочков (текст, цвет, жирный)."""
+        d = self.collector.data
+        m = self.t["muted"]
+        cpu_t = self.temp_segment(d.get("cpu_temp"), d.get("cpu_temp_limit"))
+        gpu_t = self.temp_segment(d.get("gpu_temp"), d.get("gpu_temp_limit"))
+        ram = (fmt_mem(d.get("ram_used"), d.get("ram_total")), m, False)
+        vram = fmt_mem(d.get("vram_used"), d.get("vram_total"))
+        self.lines = {
+            "bars": {"cpu": [("Температура: ", m, False), cpu_t],
+                     "ram": [ram],
+                     "gpu": [gpu_t, (f"  ·  VRAM {vram}", m, False)]},
+            "gauges": {"cpu": ([("Темп. ", m, False), cpu_t], []),
+                       "ram": ([ram], []),
+                       "gpu": ([gpu_t], [(f"VRAM {vram}", m, False)])},
+        }
+
+    def animate(self, values=False):
+        """Стрелки и полосы плавно «доезжают» до нового значения (~0.3 с).
+        Подписи (values=True) перерисовываются только раз в секунду."""
         if self._anim_id:
             self.root.after_cancel(self._anim_id)
             self._anim_id = None
         moving = False
         for key, t in self.target.items():
             cur = self.shown.get(key)
-            if t is None or cur is None or abs(t - cur) < 1:
+            if t is None or cur is None or abs(t - cur) < 1.5:
                 self.shown[key] = t
             else:
-                self.shown[key] = cur + (t - cur) * 0.45
+                self.shown[key] = cur + (t - cur) * 0.6
                 moving = True
-        self.redraw(dynamic_only=True)
+        self.redraw("values" if values else "anim")
         if moving:
             self._anim_id = self.root.after(40, self.animate)
 
@@ -553,16 +704,50 @@ class Widget:
         size = -max(6, round(px * self.k))      # минус = размер в пикселях
         return (FONT, size, "bold") if bold else (FONT, size)
 
-    def redraw(self, dynamic_only=False):
-        """Полная перерисовка или (во время анимации) только меняющихся частей.
-        Неподвижные элементы (шкала, деления, подписи) рисуются один раз —
-        так виджет почти не нагружает процессор."""
+    def text(self, x, y, text, fill, font, anchor="center", tags=None):
+        """Текст; на прозрачном фоне — с тонкой обводкой, чтобы читался на любых обоях."""
+        c, ids = self.canvas, []
+        if self.transparent:
+            o = max(1, round(self.k))
+            for dx, dy in ((-o, 0), (o, 0), (0, -o), (0, o)):
+                ids.append(c.create_text(x + dx, y + dy, text=text, fill=self.outline,
+                                         font=font, anchor=anchor, tags=tags))
+        ids.append(c.create_text(x, y, text=text, fill=fill, font=font, anchor=anchor,
+                                 tags=tags))
+        return ids
+
+    def segments(self, x, y, segs, px, anchor="nw", center=False, tags="val"):
+        """Строка из кусочков разного цвета (например, красная температура)."""
+        c, items, cx = self.canvas, [], x
+        for text, color, bold in segs:
+            if not text:
+                continue
+            ids = self.text(cx, y, text, color, self.font(px, bold), anchor=anchor, tags=tags)
+            items += ids
+            bb = c.bbox(ids[-1])
+            if bb:
+                cx = bb[2]
+        if center and items:
+            for i in items:
+                c.move(i, -(cx - x) / 2, 0)
+
+    def redraw(self, part="all"):
+        """Перерисовка по частям, чтобы виджет почти не нагружал процессор:
+          "all"    — всё (смена размера, вида, темы);
+          "values" — подписи и стрелки (раз в секунду);
+          "anim"   — только стрелки и полосы (кадры плавной анимации).
+        Неподвижные элементы (шкала, деления, названия) рисуются только при "all"."""
+        if not hasattr(self, "t"):
+            return
         c = self.canvas
-        self.full = not dynamic_only
-        if dynamic_only:
-            c.delete("dyn")
-        else:
+        self.full = part == "all"
+        self.vals = part != "anim"
+        if part == "all":
             c.delete("all")
+        elif part == "values":
+            c.delete("val", "anim")
+        else:
+            c.delete("anim")
         self.k = self.W / VIEWS[self.s["view"]][0]
         try:
             if self.s["view"] == "gauges":
@@ -571,11 +756,13 @@ class Widget:
                 self.draw_bars()
         except Exception:
             pass
-        if self.hover and self.full:
+        if part == "anim":
+            c.tag_raise("val")                     # подписи поверх стрелок
+        if self.full and self.hover:
             self.draw_grip()
 
     def draw_bars(self):
-        c, k = self.canvas, self.k
+        c, k, t = self.canvas, self.k, self.t
         lines = self.lines.get("bars", {})
         pad = 12 * k
         for i, (key, title) in enumerate(METRICS):
@@ -583,16 +770,16 @@ class Widget:
             value, shown = self.target.get(key), self.shown.get(key)
             by, bh = y0 + 37 * k, max(2, 5 * k)
             if self.full:
-                c.create_text(pad, y0, text=title, anchor="nw", fill=FG, font=self.font(13, True))
-                c.create_rectangle(pad, by, self.W - pad, by + bh, fill=BAR_BG, width=0)
-            c.create_text(self.W - pad, y0, text=fmt_pct(value), anchor="ne", fill=FG,
-                          font=self.font(13, True), tags="dyn")
-            c.create_text(pad, y0 + 19 * k, text=lines.get(key, ""), anchor="nw", fill=MUTED,
-                          font=self.font(11), tags="dyn")
+                self.text(pad, y0, title, t["fg"], self.font(13, True), anchor="nw")
+                c.create_rectangle(pad, by, self.W - pad, by + bh, fill=t["track"], width=0)
+            if self.vals:
+                self.text(self.W - pad, y0, fmt_pct(value), t["fg"], self.font(13, True),
+                          anchor="ne", tags="val")
+                self.segments(pad, y0 + 19 * k, lines.get(key, []), 11)
             if shown:
                 p = clamp(shown, 0, 100) / 100
                 c.create_rectangle(pad, by, pad + (self.W - 2 * pad) * p, by + bh,
-                                   fill=bar_color(value), width=0, tags="dyn")
+                                   fill=self.color_for_load(value), width=0, tags="anim")
 
     def draw_gauges(self):
         k = self.k
@@ -600,11 +787,11 @@ class Widget:
         for i, (key, title) in enumerate(METRICS):
             cx, cy, r = (60 + i * 120) * k, 58 * k, 42 * k
             self.draw_gauge(cx, cy, r, title, self.target.get(key), self.shown.get(key),
-                            lines.get(key, (NA, "")))
+                            lines.get(key, ([], [])))
 
     def draw_gauge(self, cx, cy, r, title, value, shown, lines):
         """Спидометр: шкала 240°, от 0% (слева внизу) до 100% (справа внизу)."""
-        c, k = self.canvas, self.k
+        c, k, t = self.canvas, self.k, self.t
         th = max(2, 6 * k)                                   # толщина дуги
 
         def pt(angle_deg, radius):
@@ -618,52 +805,59 @@ class Widget:
         if self.full:
             # цветные зоны снаружи
             zr = r + th / 2 + 3 * k
-            for a, b, col in ZONES:
+            for a, b, col in self.zones:
                 c.create_arc(cx - zr, cy - zr, cx + zr, cy + zr, start=angle(b),
                              extent=(b - a) * 2.4, style="arc", width=max(1, 2 * k), outline=col)
             # дорожка
-            c.create_arc(*box, start=-30, extent=240, style="arc", width=th, outline=BAR_BG)
+            c.create_arc(*box, start=-30, extent=240, style="arc", width=th, outline=t["track"])
             # деления: крупные через 20%, мелкие через 10%
             for i in range(11):
                 major = i % 2 == 0
                 r1 = r - th / 2 - 2 * k
                 r2 = r1 - (6 if major else 3) * k
-                c.create_line(*pt(angle(i * 10), r1), *pt(angle(i * 10), r2), fill=MUTED,
+                c.create_line(*pt(angle(i * 10), r1), *pt(angle(i * 10), r2), fill=t["muted"],
                               width=max(1, (1.6 if major else 1) * k))
-            c.create_text(cx, cy + r * 0.88, text=title, fill=MUTED, font=self.font(10, True))
+            self.text(cx, cy + r * 0.88, title, t["muted"], self.font(10, True))
         # заполнение дуги
         if shown and shown >= 0.5:
             c.create_arc(*box, start=210, extent=-clamp(shown, 0, 100) * 2.4, style="arc",
-                         width=th, outline=bar_color(value), tags="dyn")
+                         width=th, outline=self.color_for_load(value), tags="anim")
         # стрелка
         a = math.radians(angle(shown or 0))
         dx, dy = math.cos(a), -math.sin(a)                   # направление стрелки
         px, py = -dy, dx                                     # перпендикуляр
         L, tail, w = r * 0.78, r * 0.14, 2.4 * k
-        needle_col = NEEDLE if shown is not None else MUTED
+        needle_col = t["needle"] if shown is not None else t["muted"]
         c.create_polygon(cx + dx * L, cy + dy * L,
                          cx + px * w, cy + py * w,
                          cx - dx * tail, cy - dy * tail,
                          cx - px * w, cy - py * w,
-                         fill=needle_col, outline="", tags="dyn")
+                         fill=needle_col, outline="", tags="anim")
         hr = 4.5 * k
-        c.create_oval(cx - hr, cy - hr, cx + hr, cy + hr, fill="#2a2e36",
-                      outline=needle_col, width=max(1, 1.5 * k), tags="dyn")
-        # подписи
-        c.create_text(cx, cy + r * 0.45, text=fmt_pct(value), fill=FG, font=self.font(15, True),
-                      tags="dyn")
-        c.create_text(cx, cy + r + 10 * k, text=lines[0], fill=MUTED, font=self.font(10),
-                      tags="dyn")
-        if lines[1]:
-            c.create_text(cx, cy + r + 24 * k, text=lines[1], fill=MUTED, font=self.font(10),
-                          tags="dyn")
+        c.create_oval(cx - hr, cy - hr, cx + hr, cy + hr, fill=t["track"],
+                      outline=needle_col, width=max(1, 1.5 * k), tags="anim")
+        # подписи (раз в секунду)
+        if self.vals:
+            self.text(cx, cy + r * 0.45, fmt_pct(value), t["fg"], self.font(15, True),
+                      tags="val")
+            self.segments(cx, cy + r + 10 * k, lines[0], 10, anchor="w", center=True)
+            if lines[1]:
+                self.segments(cx, cy + r + 24 * k, lines[1], 10, anchor="w", center=True)
 
     def draw_grip(self):
-        """Метка в правом нижнем углу: «за угол можно тянуть»."""
+        """Уголок в правом нижнем углу (виден при наведении): «за угол можно тянуть».
+        На прозрачном фоне это закрашенный треугольник — за него удобно ухватиться."""
         c, k = self.canvas, self.k
+        if self.transparent:
+            s = max(12, 16 * k)
+            c.create_polygon(self.W, self.H, self.W - s, self.H, self.W, self.H - s,
+                             fill=blend(self.t["muted"], self.t["bg"], 0.55), outline="",
+                             tags="grip")
+            return
         x, y = self.W - 4 * k, self.H - 4 * k
+        col = blend(self.t["muted"], self.t["bg"], 0.5)
         for d in (4, 8, 12):
-            c.create_line(x - d * k, y, x, y - d * k, fill="#4a4f59", width=max(1, k))
+            c.create_line(x - d * k, y, x, y - d * k, fill=col, width=max(1, k), tags="grip")
 
     def run(self):
         self.root.mainloop()
@@ -716,6 +910,7 @@ def selftest():
     print(f"\n  Выбран GPU-источник и итоговые данные:")
     d = c.sample()
     print(f"  GPU-источник: {c.gpu_kind}")
+    print(f"  Процессор: {cpu_name()}  (Tjmax {d['cpu_temp_limit']} °C)")
     for k, v in d.items():
         print(f"    {k:10} = {v}")
 

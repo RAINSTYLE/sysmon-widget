@@ -19,19 +19,31 @@ if os.path.exists(widget.SETTINGS_FILE):
 ctypes.windll.user32.SetCursorPos(5, 5)        # курсор подальше: уголок не показывается
 
 
-class Fake:
-    data = {}
+def disk(name, total, used):
+    return {"name": name, "total": total * 2**30, "used": used * 2**30,
+            "free": (total - used) * 2**30, "percent": used / total * 100}
 
 
-def data(cpu, ram, gpu, gpu_t=46, cpu_t=52):
+DISKS = [disk("C:", 465, 315), disk("D:", 931, 540), disk("E:", 1863, 1640)]
+
+
+def data(cpu, ram, gpu, gpu_t=46, cpu_t=52, down=48.6e6, up=2.1e6):
     return {"cpu": cpu, "ram": ram, "ram_used": 32 * 2**30 * ram / 100, "ram_total": 32 * 2**30,
             "gpu": gpu, "vram_used": 16 * 2**30 * (0.1 + gpu / 140), "vram_total": 16 * 2**30,
-            "gpu_temp": gpu_t, "gpu_temp_limit": 87, "cpu_temp": cpu_t, "cpu_temp_limit": 95}
+            "gpu_temp": gpu_t, "gpu_temp_limit": 87, "cpu_temp": cpu_t, "cpu_temp_limit": 95,
+            "net_down": down / 8, "net_up": up / 8, "disks": DISKS}
+
+
+class Fake:
+    show = widget.DEFAULT_SHOW
+    data = data(34, 41, 22)
 
 
 w = widget.Widget()
 w.root.attributes("-alpha", 1.0)      # непрозрачно — чтобы на снимок не попал рабочий стол
 w.collector = Fake()
+w.s["show"].update(widget.DEFAULT_SHOW)   # на картинках — все показатели
+w.s["net_units"] = "bits"
 w.root.geometry("+160+160")
 
 
@@ -67,8 +79,8 @@ def settle(n=15):
 
 
 def snapshot(view, d, name, scale=1.2):
-    set_view(view, scale)
     Fake.data = d
+    set_view(view, scale)
     settle()
     grab().save(os.path.join(OUT, name))
 
@@ -82,8 +94,8 @@ def font(px, bold=False):
 
 def themes_sheet():
     """Все темы: спидометры, сетка 3×2 с подписями."""
-    set_view("gauges", 1.0)
     Fake.data = data(34, 72, 91, gpu_t=85, cpu_t=85)
+    set_view("gauges", 1.0)
     tiles = []
     for key, th in widget.THEMES.items():
         style(key)
@@ -123,9 +135,9 @@ def transparent_example():
     """Виджет с прозрачным фоном поверх «обоев»: оба вида рядом."""
     shots = []
     for view in ("gauges", "bars"):
+        Fake.data = data(34, 41, 22)
         set_view(view, 1.1)
         style("graphite", transparent=True)
-        Fake.data = data(34, 41, 22)
         margin = 28
         bw, bh = w.W + 2 * margin, w.H + 2 * margin
         bg = backdrop_image(bw, bh)
@@ -135,7 +147,15 @@ def transparent_example():
         top.geometry(f"{bw}x{bh}+{x}+{y}")
         photo = ImageTk.PhotoImage(bg)
         tk.Label(top, image=photo, bd=0).pack()
-        top.update(); w.root.lift(); w.root.attributes("-topmost", True)
+        # подложка поверх всех окон (иначе сквозь прозрачный виджет виден рабочий стол),
+        # а виджет — поверх подложки
+        top.attributes("-topmost", True)
+        top.update()
+        w.root.attributes("-topmost", False)
+        w.root.attributes("-topmost", True)
+        w.root.lift()
+        for _ in range(10):
+            w.root.update(); w.root.after(50)
         settle(20); w.root.update(); w.root.after(300); w.root.update()
         shots.append(ImageGrab.grab(bbox=(x, y, x + bw, y + bh), all_screens=True))
         top.destroy()
@@ -158,7 +178,8 @@ def gif_gauges():
     seq = [(15, 35, 5, 41, 48), (62, 38, 48, 55, 62), (91, 41, 97, 84, 85), (45, 44, 88, 70, 80),
            (23, 40, 30, 58, 60), (15, 35, 5, 41, 48)]
     for cpu, ram, gpu, ct, gt in seq:
-        Fake.data = data(cpu, ram, gpu, gpu_t=gt, cpu_t=ct)
+        Fake.data = data(cpu, ram, gpu, gpu_t=gt, cpu_t=ct, down=gpu * 0.9e6 + 3e5,
+                         up=cpu * 0.05e6 + 1e5)
         w.refresh_lines()
         w.target = {"cpu": cpu, "ram": ram, "gpu": gpu}
         w.animate(values=True)

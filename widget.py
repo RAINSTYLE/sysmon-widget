@@ -30,7 +30,10 @@ APP_NAME = "SysMonWidget"
 SETTINGS_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 DEFAULT_SETTINGS = {"x": None, "y": None, "topmost": True, "alpha": 0.9,
-                    "scale": 1.0, "view": "bars", "theme": "graphite", "transparent": False}
+                    "scale": 1.0, "view": "bars", "theme": "graphite", "transparent": False,
+                    "net_units": "bits", "show": None}
+# Какие показатели показывать (галочки в меню «Показатели»)
+DEFAULT_SHOW = {"cpu": True, "ram": True, "gpu": True, "net": True, "disks": True}
 
 UPDATE_MS = 1000          # обновление экрана раз в секунду
 LHM_URL = "http://127.0.0.1:8085/data.json"
@@ -319,6 +322,12 @@ class Collector(threading.Thread):
         self._lhm_next = 0
         self._lhm = {}
         self.cpu_tjmax = cpu_tjmax(cpu_name())
+        self._nics, self._nics_next = set(), 0
+        self._net_prev = None
+        self.show = DEFAULT_SHOW                  # окно подменяет своими галочками
+        self._parts, self._parts_next, self._disks_next = [], 0, 0
+        self._disks = self.read_disks(time.monotonic())
+        self.data = {"disks": self._disks}       # диски известны сразу — для высоты окна
         psutil.cpu_percent(None)  # первый вызов всегда 0 — «разогреваем»
 
     def init_gpu(self):
@@ -370,7 +379,62 @@ class Collector(threading.Thread):
             d["gpu_temp"] = self._lhm.get("gpu")
         if not d["gpu_temp_limit"]:
             d["gpu_temp_limit"] = 90 if d["gpu_temp"] is not None else None
+
+        if self.show.get("net", True):
+            d["net_down"], d["net_up"] = self.net_speed(now)
+        else:                                       # выключено в меню — не опрашиваем
+            self._net_prev = None
+            d["net_down"] = d["net_up"] = None
+
+        if now >= self._disks_next:                 # место на дисках — раз в 5 с
+            self._disks = self.read_disks(now)
+            self._disks_next = now + 5
+        d["disks"] = self._disks
         return d
+
+    def read_disks(self, now):
+        """Локальные диски (C:, D:, …): объём, занято, свободно. Флешки и DVD не показываем."""
+        try:
+            if now >= self._parts_next:             # список дисков — раз в 30 с
+                self._parts = [p.mountpoint for p in psutil.disk_partitions(all=False)
+                               if "fixed" in p.opts.split(",")]
+                self._parts_next = now + 30
+        except Exception:
+            pass
+        disks = []
+        for mp in self._parts:
+            try:
+                u = psutil.disk_usage(mp)
+            except Exception:
+                continue
+            disks.append({"name": mp.rstrip("\\/"), "total": u.total, "used": u.used,
+                          "free": u.free, "percent": u.percent})
+        return disks
+
+    # Виртуальные адаптеры дублируют трафик реального — их не считаем
+    VIRTUAL_NICS = ("loopback", "vethernet", "vmware", "virtualbox", "hyper-v", "wsl",
+                    "bluetooth", "pseudo")
+
+    def net_speed(self, now):
+        """Скорость загрузки и выгрузки (байт/с) по всем реальным сетевым адаптерам."""
+        try:
+            if now >= self._nics_next:              # список адаптеров — раз в 30 с
+                stats = psutil.net_if_stats()
+                self._nics = {n for n, st in stats.items() if st.isup and
+                              not any(v in n.lower() for v in self.VIRTUAL_NICS)}
+                self._nics_next = now + 30
+            counters = psutil.net_io_counters(pernic=True)
+            recv = sum(c.bytes_recv for n, c in counters.items() if n in self._nics)
+            sent = sum(c.bytes_sent for n, c in counters.items() if n in self._nics)
+        except Exception:
+            self._net_prev = None
+            return None, None
+        prev, self._net_prev = self._net_prev, (now, recv, sent)
+        if prev is None or now - prev[0] <= 0:
+            return None, None
+        dt = now - prev[0]
+        # счётчики сбрасываются при переподключении адаптера — отрицательное считаем нулём
+        return max(0, recv - prev[1]) / dt, max(0, sent - prev[2]) / dt
 
     def run(self):
         while True:
@@ -389,6 +453,14 @@ def load_settings():
             s.update(json.load(f))
     except Exception:
         pass
+    show = dict(DEFAULT_SHOW)
+    if isinstance(s.get("show"), dict):
+        show.update({k: bool(v) for k, v in s["show"].items() if k in show})
+    if "show_disks" in s:                         # настройка из версии 1.2
+        show["disks"] = bool(s.pop("show_disks"))
+    if not any(show.values()):
+        show = dict(DEFAULT_SHOW)
+    s["show"] = show
     return s
 
 
@@ -401,10 +473,18 @@ def save_settings(s):
         pass
 
 
-# Базовые размеры окна (при масштабе 100%) для каждого вида
-VIEWS = {"bars": (230, 182), "gauges": (360, 146)}
+# Виды. Размеры окна считаются в layout() по включённым показателям.
+VIEWS = ("bars", "gauges")
+DISK_ROW = {"bars": 28, "gauges": 20}     # высота строки одного диска (базовые пиксели)
 MIN_SCALE, MAX_SCALE = 0.6, 3.0
 METRICS = (("cpu", "CPU"), ("ram", "RAM"), ("gpu", "GPU"))
+SHOW_ITEMS = (("cpu", "CPU"), ("ram", "RAM (оперативная память)"), ("gpu", "GPU (видеокарта)"),
+              ("net", "Скорость интернета"), ("disks", "Диски"))
+
+
+class _MonitorInfo(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
 
 
 class Widget:
@@ -431,6 +511,9 @@ class Widget:
         self._anim_id = None
         self._press = None
 
+        self.collector = Collector()              # заранее: высота окна зависит от числа дисков
+        self.collector.show = self.s["show"]      # выключенное не опрашиваем
+        self._disk_n = self.disk_count()
         self.W, self.H = self.size_for(self.scale)
         self.place_window()
 
@@ -439,6 +522,8 @@ class Widget:
         self.view_var = tk.StringVar(value=self.s["view"])
         self.theme_var = tk.StringVar(value=self.s["theme"])
         self.transparent_var = tk.BooleanVar(value=bool(self.s["transparent"]))
+        self.net_units_var = tk.StringVar(value=self.s.get("net_units") or "bits")
+        self.show_vars = {key: tk.BooleanVar(value=self.s["show"][key]) for key, _ in SHOW_ITEMS}
         self.menu = self.build_menu()
 
         c = self.canvas
@@ -448,11 +533,11 @@ class Widget:
         c.bind("<Motion>", self.on_motion)
         c.bind("<Button-3>", self.show_menu)
 
-        self.collector = Collector()
         self.collector.start()
         self.apply_style()
         self.root.after(300, self.refresh)
         self.root.after(500, self.poll_hover)
+        self.root.after(400, self.keep_on_screen)
 
     # ----- оформление: тема и прозрачный фон -----
     def apply_style(self):
@@ -496,8 +581,65 @@ class Widget:
         return (fmt_temp(temp), color, lvl == 2)
 
     # ----- размер и позиция -----
+    def disk_count(self):
+        if not self.s["show"]["disks"]:
+            return 0
+        return len(self.collector.data.get("disks") or [])
+
+    def layout(self):
+        """Раскладка по включённым показателям, в базовых пикселях (масштаб 100%).
+        Возвращает ширину, высоту и словарь: где рисовать основные показатели,
+        строку сети и блок дисков."""
+        view, show = self.s["view"], self.s["show"]
+        main = [(key, title) for key, title in METRICS if show[key]]
+        n_disks = self.disk_count()
+        L = {"main": [], "net": None, "disks": None}
+        if view == "bars":
+            bw, y = 230, 8
+            for key, title in main:                    # строки CPU / RAM / GPU друг за другом
+                L["main"].append((key, title, y))
+                y += 56
+            if show["net"]:
+                L["net"] = y - 2 if main else 8
+                y = L["net"] + 22
+            if n_disks:
+                L["disks"] = y + 2 if (main or show["net"]) else 12
+                y = L["disks"] + n_disks * DISK_ROW[view] + 6
+            elif not show["net"]:
+                y += 6
+            return bw, y, L
+
+        # спидометры: столько шкал, сколько включено; ширина подстраивается
+        n = len(main)
+        bw = 120 * n
+        if show["net"]:
+            bw = max(bw, 240)
+        if n_disks:
+            bw = max(bw, 300)
+        off = (bw - 120 * n) / 2
+        for i, (key, title) in enumerate(main):
+            L["main"].append((key, title, off + 60 + 120 * i))
+        gpu_in = show["gpu"]
+        y = (146 if gpu_in else 132) if n else 0
+        net_row = False
+        if show["net"]:
+            cols = n - 1 if gpu_in else n              # свободные колонки в нижней строке
+            if cols >= 2:
+                # в нижней строке под шкалами, левее строки VRAM (GPU — всегда последняя шкала)
+                L["net"] = (off + 60 * cols, 124)
+                y = 146
+            else:                                      # места нет — отдельной строкой
+                ny = (y if n else 4) + 9
+                L["net"] = (bw / 2, ny)
+                y, net_row = ny + 13, True
+        if n_disks:
+            L["disks"] = (y + 4 if net_row else y - 4) if y else 10
+            y = L["disks"] + n_disks * DISK_ROW[view] + 6
+        return bw, y, L
+
     def size_for(self, scale):
-        bw, bh = VIEWS[self.s["view"]]
+        bw, bh, self.L = self.layout()
+        self.bw = bw
         k = scale * self.dpi
         return round(bw * k), round(bh * k)
 
@@ -588,6 +730,11 @@ class Widget:
         views.add_radiobutton(label="Спидометры", value="gauges", variable=self.view_var,
                               command=self.set_view)
         m.add_cascade(label="Вид", menu=views)
+        items = tk.Menu(m, tearoff=0)
+        for key, label in SHOW_ITEMS:
+            items.add_checkbutton(label=label, variable=self.show_vars[key],
+                                  command=lambda k=key: self.toggle_show(k))
+        m.add_cascade(label="Показатели", menu=items)
         themes = tk.Menu(m, tearoff=0)
         for key, th in THEMES.items():
             themes.add_radiobutton(label=th["name"], value=key, variable=self.theme_var,
@@ -600,6 +747,12 @@ class Widget:
             sub.add_radiobutton(label=f"{pct}%", value=pct / 100, variable=self.alpha_var,
                                 command=self.set_alpha)
         m.add_cascade(label="Прозрачность", menu=sub)
+        net = tk.Menu(m, tearoff=0)
+        net.add_radiobutton(label="Мбит/с (как у провайдера)", value="bits",
+                            variable=self.net_units_var, command=self.set_net_units)
+        net.add_radiobutton(label="МБ/с (как при скачивании)", value="bytes",
+                            variable=self.net_units_var, command=self.set_net_units)
+        m.add_cascade(label="Скорость сети в", menu=net)
         m.add_command(label="Сбросить размер", command=self.reset_size)
         m.add_separator()
         m.add_command(label="Закрыть", command=self.close)
@@ -626,6 +779,22 @@ class Widget:
         save_settings(self.s)
         self.apply_style()
 
+    def toggle_show(self, key):
+        """Галочка в меню «Показатели». Последнюю галочку снять нельзя — окно стало бы пустым."""
+        value = bool(self.show_vars[key].get())
+        if not value and sum(self.s["show"].values()) <= 1:
+            self.show_vars[key].set(True)
+            return
+        self.s["show"][key] = value
+        self._disk_n = self.disk_count()
+        self.resize_to(self.scale)
+
+    def set_net_units(self):
+        self.s["net_units"] = self.net_units_var.get()
+        save_settings(self.s)
+        self.refresh_lines()
+        self.redraw("values")
+
     def toggle_transparent(self):
         self.s["transparent"] = bool(self.transparent_var.get())
         self.hover = False
@@ -637,7 +806,30 @@ class Widget:
         self.W, self.H = self.size_for(scale)
         self.root.geometry(f"{self.W}x{self.H}")
         self.redraw()
+        self.keep_on_screen()
         self.save_geometry()
+
+    def keep_on_screen(self):
+        """Если окно (например, выросшее из-за дисков) вылезает за рабочую область
+        своего монитора или под панель задач — сдвигаем его внутрь."""
+        try:
+            self.root.update_idletasks()
+            u = ctypes.windll.user32
+            hwnd = u.GetParent(self.root.winfo_id())
+            mon = u.MonitorFromWindow(hwnd, 2)               # MONITOR_DEFAULTTONEAREST
+            info = _MonitorInfo()
+            info.cbSize = ctypes.sizeof(info)
+            if not u.GetMonitorInfoW(mon, ctypes.byref(info)):
+                return
+            wa = info.rcWork
+            x, y = self.root.winfo_x(), self.root.winfo_y()
+            nx = max(wa.left, min(x, wa.right - self.W))
+            ny = max(wa.top, min(y, wa.bottom - self.H))
+            if (nx, ny) != (x, y):
+                self.root.geometry(f"+{nx}+{ny}")
+                self.save_geometry()
+        except Exception:
+            pass
 
     def set_view(self):
         self.s["view"] = self.view_var.get()
@@ -659,6 +851,10 @@ class Widget:
             d = self.collector.data
             self.target = {"cpu": d.get("cpu"), "ram": d.get("ram"), "gpu": d.get("gpu")}
             self.refresh_lines()
+            n = self.disk_count()
+            if n != self._disk_n:                 # подключили/отключили диск — меняем высоту
+                self._disk_n = n
+                self.resize_to(self.scale)
             self.animate(values=True)
         except Exception:
             pass  # никогда не падаем из-за отображения
@@ -672,7 +868,11 @@ class Widget:
         gpu_t = self.temp_segment(d.get("gpu_temp"), d.get("gpu_temp_limit"))
         ram = (fmt_mem(d.get("ram_used"), d.get("ram_total")), m, False)
         vram = fmt_mem(d.get("vram_used"), d.get("vram_total"))
+        units = self.s.get("net_units") or "bits"
+        net = [("▼ ", self.t["accent"], False), (fmt_speed(d.get("net_down"), units), m, False),
+               ("    ▲ ", self.t["needle"], False), (fmt_speed(d.get("net_up"), units), m, False)]
         self.lines = {
+            "net": net,
             "bars": {"cpu": [("Температура: ", m, False), cpu_t],
                      "ram": [ram],
                      "gpu": [gpu_t, (f"  ·  VRAM {vram}", m, False)]},
@@ -716,8 +916,9 @@ class Widget:
                                  tags=tags))
         return ids
 
-    def segments(self, x, y, segs, px, anchor="nw", center=False, tags="val"):
-        """Строка из кусочков разного цвета (например, красная температура)."""
+    def segments(self, x, y, segs, px, anchor="nw", align="left", tags="val"):
+        """Строка из кусочков разного цвета (например, красная температура).
+        align: "left" — начинается в x, "center" — по центру x, "right" — заканчивается в x."""
         c, items, cx = self.canvas, [], x
         for text, color, bold in segs:
             if not text:
@@ -727,9 +928,10 @@ class Widget:
             bb = c.bbox(ids[-1])
             if bb:
                 cx = bb[2]
-        if center and items:
+        shift = {"center": -(cx - x) / 2, "right": -(cx - x)}.get(align, 0)
+        if shift and items:
             for i in items:
-                c.move(i, -(cx - x) / 2, 0)
+                c.move(i, shift, 0)
 
     def redraw(self, part="all"):
         """Перерисовка по частям, чтобы виджет почти не нагружал процессор:
@@ -748,12 +950,14 @@ class Widget:
             c.delete("val", "anim")
         else:
             c.delete("anim")
-        self.k = self.W / VIEWS[self.s["view"]][0]
+        self.k = self.W / self.bw
         try:
             if self.s["view"] == "gauges":
                 self.draw_gauges()
             else:
                 self.draw_bars()
+            if self.disk_count():
+                self.draw_disks()
         except Exception:
             pass
         if part == "anim":
@@ -765,8 +969,8 @@ class Widget:
         c, k, t = self.canvas, self.k, self.t
         lines = self.lines.get("bars", {})
         pad = 12 * k
-        for i, (key, title) in enumerate(METRICS):
-            y0 = (8 + i * 56) * k
+        for key, title, y in self.L["main"]:
+            y0 = y * k
             value, shown = self.target.get(key), self.shown.get(key)
             by, bh = y0 + 37 * k, max(2, 5 * k)
             if self.full:
@@ -780,14 +984,67 @@ class Widget:
                 p = clamp(shown, 0, 100) / 100
                 c.create_rectangle(pad, by, pad + (self.W - 2 * pad) * p, by + bh,
                                    fill=self.color_for_load(value), width=0, tags="anim")
+        # строка «Сеть» внизу
+        if self.L["net"] is None:
+            return
+        ny = self.L["net"] * k
+        if self.full:
+            self.text(pad, ny, "Сеть", t["muted"], self.font(11, True), anchor="nw")
+        if self.vals:
+            self.segments(self.W - pad, ny, self.lines.get("net", []), 11, align="right")
+
+    def draw_disks(self):
+        """Диски: буква, полоса занятости и «занято / объём · свободно».
+        Обновляются раз в секунду вместе с подписями (на кадрах анимации не трогаем)."""
+        if not (self.full or self.vals):
+            return
+        c, k, t = self.canvas, self.k, self.t
+        view = self.s["view"]
+        disks = self.collector.data.get("disks") or []
+        pad, top, row = 12 * k, self.L["disks"] * k, DISK_ROW[view] * k
+        if self.full and self.L["disks"] > 20:              # тонкий разделитель
+            c.create_line(pad, top - 5 * k, self.W - pad, top - 5 * k, fill=t["track"],
+                          width=max(1, k))
+        for i, dk in enumerate(disks):
+            used, free = fmt_disk(dk)
+            lvl = disk_level(dk["percent"])
+            col = (t["accent"], t["warn"], t["danger"])[lvl]
+            free_col = (t["muted"], t["warn"], t["danger"])[lvl]
+            text = [(used, t["muted"], False), ("  ·  ", t["muted"], False),
+                    (free, free_col, lvl == 2)]
+            if view == "gauges":                            # одна строка: C:  ▬▬▬  315 / 465 ГБ · своб.
+                y = top + i * row + row / 2
+                x0, x1, bh = 38 * k, (self.bw - 170) * k, max(2, 5 * k)
+                if self.full:
+                    self.text(pad, y, dk["name"], t["fg"], self.font(11, True), anchor="w")
+                    c.create_rectangle(x0, y - bh / 2, x1, y + bh / 2, fill=t["track"], width=0)
+                if self.vals:
+                    c.create_rectangle(x0, y - bh / 2, x0 + (x1 - x0) * dk["percent"] / 100,
+                                       y + bh / 2, fill=col, width=0, tags="val")
+                    self.segments(self.W - pad, y, text, 10, anchor="w", align="right")
+            else:                                           # две строки: текст, под ним полоса
+                y = top + i * row
+                by, bh = y + 17 * k, max(2, 4 * k)
+                if self.full:
+                    self.text(pad, y, dk["name"], t["fg"], self.font(11, True), anchor="nw")
+                    c.create_rectangle(pad, by, self.W - pad, by + bh, fill=t["track"], width=0)
+                if self.vals:
+                    c.create_rectangle(pad, by, pad + (self.W - 2 * pad) * dk["percent"] / 100,
+                                       by + bh, fill=col, width=0, tags="val")
+                    self.segments(self.W - pad, y + 1 * k, text, 10, align="right")
 
     def draw_gauges(self):
         k = self.k
         lines = self.lines.get("gauges", {})
-        for i, (key, title) in enumerate(METRICS):
-            cx, cy, r = (60 + i * 120) * k, 58 * k, 42 * k
+        for key, title, x in self.L["main"]:
+            cx, cy, r = x * k, 58 * k, 42 * k
             self.draw_gauge(cx, cy, r, title, self.target.get(key), self.shown.get(key),
                             lines.get(key, ([], [])))
+        # скорость сети — в нижней строке левее VRAM, либо отдельной строкой
+        if self.vals and self.L["net"]:
+            nx, ny = self.L["net"]
+            self.segments(nx * k, ny * k, self.lines.get("net", []), 10,
+                          anchor="w", align="center")
 
     def draw_gauge(self, cx, cy, r, title, value, shown, lines):
         """Спидометр: шкала 240°, от 0% (слева внизу) до 100% (справа внизу)."""
@@ -840,9 +1097,9 @@ class Widget:
         if self.vals:
             self.text(cx, cy + r * 0.45, fmt_pct(value), t["fg"], self.font(15, True),
                       tags="val")
-            self.segments(cx, cy + r + 10 * k, lines[0], 10, anchor="w", center=True)
+            self.segments(cx, cy + r + 10 * k, lines[0], 10, anchor="w", align="center")
             if lines[1]:
-                self.segments(cx, cy + r + 24 * k, lines[1], 10, anchor="w", center=True)
+                self.segments(cx, cy + r + 24 * k, lines[1], 10, anchor="w", align="center")
 
     def draw_grip(self):
         """Уголок в правом нижнем углу (виден при наведении): «за угол можно тянуть».
@@ -873,6 +1130,36 @@ def fmt_pct(p):
 
 def fmt_temp(t):
     return NA if t is None else f"{t:.0f} °C"
+
+
+def fmt_speed(bps, units="bits"):
+    """Скорость сети: Мбит/с (как у провайдера) или МБ/с (как при скачивании)."""
+    if bps is None:
+        return NA
+    if units == "bits":
+        v, small, big = bps * 8 / 1000, "Кбит/с", "Мбит/с"
+    else:
+        v, small, big = bps / 1024, "КБ/с", "МБ/с"
+    if round(v) < 1000:
+        return f"{v:.0f} {small}"
+    v /= 1000 if units == "bits" else 1024
+    return f"{v:.1f} {big}" if round(v, 1) < 100 else f"{v:.0f} {big}"
+
+
+def fmt_disk(dk):
+    """«315 / 465 ГБ · своб. 150 ГБ» (единицы — по общему объёму диска)."""
+    unit = "ГБ" if round(dk["total"] / 2**30) < 1000 else "ТБ"
+    conv = (lambda b: f"{b / 2**30:.0f}") if unit == "ГБ" else (lambda b: f"{b / 2**40:.1f}")
+    free = dk["free"] / 2**30
+    free_s = f"{free:.0f} ГБ" if round(free) < 1000 else f"{free / 1024:.1f} ТБ"
+    return f"{conv(dk['used'])} / {conv(dk['total'])} {unit}", f"своб. {free_s}"
+
+
+def disk_level(p):
+    """0 — норма, 1 — занято от 85%, 2 — занято от 95% (места почти нет)."""
+    if p is None or p < 85:
+        return 0
+    return 1 if p < 95 else 2
 
 
 def fmt_mem(used, total):
@@ -910,6 +1197,9 @@ def selftest():
     print(f"\n  Выбран GPU-источник и итоговые данные:")
     d = c.sample()
     print(f"  GPU-источник: {c.gpu_kind}")
+    print(f"  Сетевые адаптеры: {', '.join(sorted(c._nics)) or 'нет'}")
+    for dk in d["disks"]:
+        print(f"  Диск {dk['name']}  {' · '.join(fmt_disk(dk))} ({dk['percent']:.0f}%)")
     print(f"  Процессор: {cpu_name()}  (Tjmax {d['cpu_temp_limit']} °C)")
     for k, v in d.items():
         print(f"    {k:10} = {v}")

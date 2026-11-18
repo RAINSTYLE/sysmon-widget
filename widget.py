@@ -482,6 +482,67 @@ SHOW_ITEMS = (("cpu", "CPU"), ("ram", "RAM (оперативная память)
               ("net", "Скорость интернета"), ("disks", "Диски"))
 
 
+# ---------- автозапуск вместе с Windows ----------
+# Запись в реестре текущего пользователя (как у Steam, Discord и т.п.): права администратора
+# не нужны, запись видна в Диспетчере задач на вкладке «Автозагрузка».
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_LNK = os.path.join(os.environ.get("APPDATA", ""),
+                           r"Microsoft\Windows\Start Menu\Programs\Startup", APP_NAME + ".lnk")
+
+
+def autostart_command():
+    """Команда запуска: сам .exe или pythonw.exe + widget.py (если запущено из исходников)."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    exe = sys.executable
+    pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")   # без чёрного окна консоли
+    if os.path.exists(pythonw):
+        exe = pythonw
+    return f'"{exe}" "{os.path.abspath(__file__)}"'
+
+
+def autostart_get():
+    """Текущая команда автозапуска или None, если автозапуск выключен."""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            return winreg.QueryValueEx(k, APP_NAME)[0]
+    except OSError:
+        return None
+
+
+def autostart_enabled():
+    # ярлык в папке «Автозагрузка» — от add_to_autostart.bat из прошлых версий
+    return autostart_get() is not None or os.path.exists(STARTUP_LNK)
+
+
+def autostart_set(on):
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+        if on:
+            winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, autostart_command())
+        else:
+            try:
+                winreg.DeleteValue(k, APP_NAME)
+            except OSError:
+                pass
+    if not on and os.path.exists(STARTUP_LNK):
+        try:
+            os.remove(STARTUP_LNK)
+        except OSError:
+            pass
+
+
+def autostart_refresh():
+    """Если автозапуск включён, а .exe перенесли в другую папку — обновляем путь."""
+    cur = autostart_get()
+    if cur is not None and getattr(sys, "frozen", False) and cur != autostart_command():
+        try:
+            autostart_set(True)
+        except OSError:
+            pass
+
+
 class _MonitorInfo(ctypes.Structure):
     _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
                 ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
@@ -518,6 +579,8 @@ class Widget:
         self.place_window()
 
         self.topmost_var = tk.BooleanVar(value=bool(self.s["topmost"]))
+        autostart_refresh()
+        self.autostart_var = tk.BooleanVar(value=autostart_enabled())
         self.alpha_var = tk.DoubleVar(value=float(self.s["alpha"]))
         self.view_var = tk.StringVar(value=self.s["view"])
         self.theme_var = tk.StringVar(value=self.s["theme"])
@@ -724,6 +787,8 @@ class Widget:
         m = tk.Menu(self.root, tearoff=0)
         m.add_checkbutton(label="Всегда поверх окон", variable=self.topmost_var,
                           command=self.toggle_topmost)
+        m.add_checkbutton(label="Запускать вместе с Windows", variable=self.autostart_var,
+                          command=self.toggle_autostart)
         views = tk.Menu(m, tearoff=0)
         views.add_radiobutton(label="Полоски", value="bars", variable=self.view_var,
                               command=self.set_view)
@@ -763,6 +828,13 @@ class Widget:
             self.menu.tk_popup(e.x_root, e.y_root)
         finally:
             self.menu.grab_release()
+
+    def toggle_autostart(self):
+        try:
+            autostart_set(bool(self.autostart_var.get()))
+        except OSError:
+            pass
+        self.autostart_var.set(autostart_enabled())   # показываем то, что реально вышло
 
     def toggle_topmost(self):
         self.s["topmost"] = bool(self.topmost_var.get())
